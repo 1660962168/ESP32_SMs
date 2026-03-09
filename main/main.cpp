@@ -130,6 +130,20 @@ std::string extractVerificationCode(const std::string& content) {
     return best_fallback; // 如果没找到验证码，这里会返回空字符串 ""
 }
 
+// JSON 字符串转义函数
+std::string escapeJSON(const std::string& s) {
+    std::string res;
+    for (char c : s) {
+        if (c == '"') res += "\\\"";
+        else if (c == '\\') res += "\\\\";
+        else if (c == '\n') res += "\\n";
+        else if (c == '\r') res += ""; // 忽略回车
+        else if (c == '\t') res += "\\t";
+        else res += c;
+    }
+    return res;
+}
+
 bool sendCmdAndWait(uart_port_t uart_num, const char* cmd, const char* resp1, const char* resp2, uint32_t timeout_ms) {
     uart_flush(uart_num);
     if (cmd != nullptr) {
@@ -264,6 +278,10 @@ void Task_Push_Dispatcher(void *pvParameters) {
             }
 
             bool pushSuccess = false;
+            std::string safe_title = escapeJSON(base_title);
+            std::string safe_desp = escapeJSON(desp);
+            std::string safe_tags = escapeJSON(tags);
+            
             // 策略 A: 4G
             for (int i = 0; i < 2; i++) {
                 std::string payload = "{\"title\":\"" + base_title + "[4G]\",\"desp\":\"" + desp + "\",\"tags\":\"" + tags + "\"}";
@@ -303,9 +321,16 @@ void processSMS(uart_port_t uart_num, int devNum, SMSState& state, std::string& 
         else if (state == WAIT_PDU) {
             if (pdu.decodePDU(line.c_str())) {
                 PushMsg_t msg = { .type = MSG_TYPE_SMS };
-                strncpy(msg.sender, pdu.getSender(), 31);
-                strncpy(msg.timestamp, formatPDUTime(pdu.getTimeStamp()).c_str(), 63);
-                strncpy(msg.content, pdu.getText(), 255);
+                // 【修复】：预留最后一位，并手动加上结束符 '\0'
+                strncpy(msg.sender, pdu.getSender(), sizeof(msg.sender) - 1);
+                msg.sender[sizeof(msg.sender) - 1] = '\0';
+                
+                strncpy(msg.timestamp, formatPDUTime(pdu.getTimeStamp()).c_str(), sizeof(msg.timestamp) - 1);
+                msg.timestamp[sizeof(msg.timestamp) - 1] = '\0';
+                
+                strncpy(msg.content, pdu.getText(), sizeof(msg.content) - 1);
+                msg.content[sizeof(msg.content) - 1] = '\0';
+
                 xQueueSend(pushQueue, &msg, 0);
             }
             state = IDLE;

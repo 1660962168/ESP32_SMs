@@ -19,6 +19,12 @@
 #include "esp_timer.h"
 #include <atomic>
 #include "pdulib.h"
+#include <ctype.h>
+#include <sys/param.h>
+
+#ifndef MIN
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#endif
 
 static const char *TAG = "MAIN_APP";
 PDU pdu(4096);
@@ -50,7 +56,39 @@ char savedSSID[32] = {0};
 char savedPass[64] = {0};
 char currentIP[20] = "0.0.0.0";
 std::atomic<bool> isWifiConnected{false};
-static int wifi_retry_count = 0; // 新增重试计数器
+std::atomic<bool> isApActive{false};
+httpd_handle_t server_handle = NULL;
+const char* AP_SSID_DEFAULT = "ESP32-SMS-AP";
+const char* AP_PASS_DEFAULT = "712387500";
+
+const char html_page_start[] = R"rawliteral(
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>配网</title>
+<style>body{font-family:sans-serif;background:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
+.card{background:white;padding:20px;border-radius:10px;width:90%;max-width:400px;text-align:center}
+input,select,button{width:100%;padding:10px;margin:5px 0;border:1px solid #ddd;border-radius:5px}
+button{background:#667eea;color:white;border:none;font-weight:bold;padding:12px;cursor:pointer}</style>
+<script>
+function h(){var s=document.getElementById("s");var c=document.getElementById("c");if(s.value==="_c_"){c.style.display="block";document.getElementById("r").value="";}else{c.style.display="none";document.getElementById("r").value=s.value;}}
+function i(){document.getElementById("r").value=document.getElementById("ci").value;}
+</script></head><body><div class="card"><h2>WiFi 设置</h2><form action="/save" method="POST">
+<select id="s" onchange="h()"><option disabled selected>扫描中...</option>
+)rawliteral";
+
+const char html_page_end[] = R"rawliteral(
+<option value="_c_">手动输入...</option></select>
+<div id="c" style="display:none"><input id="ci" type="text" placeholder="WiFi名称" oninput="i()"></div>
+<input type="hidden" id="r" name="ssid">
+<input type="password" name="pass" placeholder="WiFi密码">
+<button type="submit">保存并重启</button></form></div></body></html>
+)rawliteral";
+
+const char html_success[] = R"rawliteral(
+<!DOCTYPE html><html><body style="display:flex;justify-content:center;align-items:center;height:100vh;margin:0;font-family:sans-serif;background:#eee;">
+<div style="background:white;padding:20px;border-radius:10px;text-align:center">
+<h2 style="color:#4CAF50">保存成功!</h2>
+<p>设备正在重启，请等待连接...</p>
+</div></body></html>
+)rawliteral";
 
 typedef enum
 {
@@ -226,6 +264,97 @@ void initModem(uart_port_t uart_num, const char *modName)
     vTaskDelay(pdMS_TO_TICKS(1000));
     sendCmdAndWait(uart_num, "AT+CMGF=0", "OK", "ERROR", 2000);
     ESP_LOGI(TAG, "✅ [%s] 模组初始化完成！", modName);
+}
+
+// ================= 配网 Web Server =================
+void url_decode(char *dst, const char *src) {
+    char a, b;
+    while (*src) {
+        if ((*src == '%') && ((a = src[1]) && (b = src[2])) && (isxdigit(a) && isxdigit(b))) {
+            if (a >= 'a') a -= 'a'-'A'; if (a >= 'A') a -= ('A' - 10); else a -= '0';
+            if (b >= 'a') b -= 'a'-'A'; if (b >= 'A') b -= ('A' - 10); else b -= '0';
+            *dst++ = 16*a+b; src+=3;
+        } else if (*src == '+') { *dst++ = ' '; src++; }
+        else { *dst++ = *src++; }
+    }
+    *dst = '\0';
+}
+
+static esp_err_t root_get_handler(httpd_req_t *req) {
+    httpd_resp_send_chunk(req, html_page_start, HTTPD_RESP_USE_STRLEN);
+    
+    wifi_scan_config_t scan_config = {0};
+    esp_wifi_scan_start(&scan_config, true);
+    uint16_t ap_count = 0;
+    esp_wifi_scan_get_ap_num(&ap_count);
+    if (ap_count > 0) {
+        wifi_ap_record_t *ap_info = new wifi_ap_record_t[ap_count];
+        esp_wifi_scan_get_ap_records(&ap_count, ap_info);
+        for (int i = 0; i < ap_count && i < 15; i++) {
+            char opt[128];
+            snprintf(opt, sizeof(opt), "<option value=\"%s\">%s (%ddBm)</option>", ap_info[i].ssid, ap_info[i].ssid, ap_info[i].rssi);
+            httpd_resp_send_chunk(req, opt, HTTPD_RESP_USE_STRLEN);
+        }
+        delete[] ap_info;
+    }
+    
+    httpd_resp_send_chunk(req, html_page_end, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t save_post_handler(httpd_req_t *req) {
+    char buf[200];
+    int ret = httpd_req_recv(req, buf, MIN(req->content_len, sizeof(buf) - 1));
+    if (ret <= 0) return ESP_FAIL;
+    buf[ret] = '\0';
+
+    char ssid[32] = {0}, pass[64] = {0};
+    char *p_ssid = strstr(buf, "ssid=");
+    char *p_pass = strstr(buf, "pass=");
+    
+    if (p_ssid) {
+        char *end = strchr(p_ssid, '&');
+        if (end) *end = '\0';
+        url_decode(ssid, p_ssid + 5);
+    }
+    if (p_pass) {
+        char *end = strchr(p_pass, '&');
+        if (end) *end = '\0';
+        url_decode(pass, p_pass + 5);
+    }
+
+    if (strlen(ssid) > 0) {
+        nvs_handle_t h;
+        if (nvs_open("wifi_config", NVS_READWRITE, &h) == ESP_OK) {
+            nvs_set_str(h, "ssid", ssid);
+            nvs_set_str(h, "pass", pass);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        httpd_resp_send(req, html_success, HTTPD_RESP_USE_STRLEN);
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        esp_restart();
+    }
+    return ESP_OK;
+}
+
+void start_webserver() {
+    if (server_handle != NULL) return;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    if (httpd_start(&server_handle, &config) == ESP_OK) {
+        httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
+        httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server_handle, &root);
+        httpd_register_uri_handler(server_handle, &save);
+    }
+}
+
+void stop_webserver() {
+    if (server_handle) {
+        httpd_stop(server_handle);
+        server_handle = NULL;
+    }
 }
 
 // ================= 推送引擎 =================
@@ -448,24 +577,51 @@ void Task_SMS_Rx(void *pvParameters)
     }
 }
 
+// ================= WiFi 状态机守护任务 =================
+void Task_WiFi_Manager(void *pvParameters) {
+    while (1) {
+        if (!isWifiConnected) {
+            if (!isApActive) {
+                ESP_LOGW(TAG, "WiFi Lost. 开启救援热点.");
+                esp_wifi_set_mode(WIFI_MODE_APSTA);
+                wifi_config_t ap_config = {};
+                strncpy((char*)ap_config.ap.ssid, AP_SSID_DEFAULT, sizeof(ap_config.ap.ssid));
+                strncpy((char*)ap_config.ap.password, AP_PASS_DEFAULT, sizeof(ap_config.ap.password));
+                ap_config.ap.ssid_len = strlen(AP_SSID_DEFAULT);
+                ap_config.ap.max_connection = 4;
+                ap_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+                esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+                start_webserver();
+                isApActive = true;
+            }
+            ESP_LOGI(TAG, "尝试重连 STA...");
+            esp_wifi_connect();
+        } else {
+            if (isApActive) {
+                ESP_LOGI(TAG, "WiFi OK. 关闭救援热点.");
+                stop_webserver();
+                esp_wifi_set_mode(WIFI_MODE_STA);
+                isApActive = false;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(15000));
+    }
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START)
-        esp_wifi_connect();
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        // 取消首次启动连接，交由守护任务接管
+    }
     else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
     {
         isWifiConnected = false;
-        wifi_retry_count++;
-        ESP_LOGW(TAG, "Wi-Fi 断开，正在执行无限重连策略... (累计: %d)", wifi_retry_count);
-        esp_wifi_connect(); 
     }
     else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
     {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         sprintf(currentIP, IPSTR, IP2STR(&ev->ip_info.ip));
         isWifiConnected = true;
-        wifi_retry_count = 0;
     }
 }
 
@@ -535,25 +691,33 @@ extern "C" void app_main(void)
 
     esp_netif_init();
     esp_event_loop_create_default();
+    
+    // 创建基础接口支持 APSTA 双模式
+    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap(); 
+
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
+    
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    wifi_config_t w_cfg = {};
     if (strlen(savedSSID) > 0)
     {
-        esp_netif_create_default_wifi_sta();
-        esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
-        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
-        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        esp_wifi_init(&cfg);
-        wifi_config_t w_cfg = {};
-        memset(w_cfg.sta.ssid, 0, sizeof(w_cfg.sta.ssid));
-        memset(w_cfg.sta.password, 0, sizeof(w_cfg.sta.password));
         memcpy(w_cfg.sta.ssid, savedSSID, strnlen(savedSSID, sizeof(w_cfg.sta.ssid)));
         memcpy(w_cfg.sta.password, savedPass, strnlen(savedPass, sizeof(w_cfg.sta.password)));
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        esp_wifi_set_config(WIFI_IF_STA, &w_cfg);
-        esp_wifi_start();
-        PushMsg_t boot = {.type = MSG_TYPE_BOOT};
-        xQueueSend(pushQueue, &boot, 0);
     }
+    
+    // 初始化统一切入 STA，断网降级由守护任务流转
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &w_cfg);
+    esp_wifi_start();
+
+    PushMsg_t boot = {.type = MSG_TYPE_BOOT};
+    xQueueSend(pushQueue, &boot, 0);
 
     xTaskCreate(Task_SMS_Rx, "SMSRx", 4096, NULL, 5, NULL);
     xTaskCreate(Task_Push_Dispatcher, "PushTask", 8192, NULL, 5, NULL);
+    xTaskCreate(Task_WiFi_Manager, "WiFiMgr", 4096, NULL, 4, NULL);
 }

@@ -396,7 +396,8 @@ int PDU::convert_7bit_to_unicode(unsigned char *gsm7bit, int length, char *unico
 int PDU::pduGsm7_to_unicode(const char *pdu, int numSeptets, char *unicode, char firstchar)
 {
   int r, w, length;
-  unsigned char gsm7bit[(numSeptets * 8) / 7];
+  int buffer_size = (numSeptets * 8) / 7 + 2; // +2 留出安全余量
+  unsigned char* gsm7bit = new unsigned char[buffer_size];
   w = 0;
   int index = 0; 
   if (firstchar != 0) gsm7bit[w++] = firstchar;
@@ -421,6 +422,7 @@ int PDU::pduGsm7_to_unicode(const char *pdu, int numSeptets, char *unicode, char
     }
   }
   length = convert_7bit_to_unicode(gsm7bit, w, unicode);
+  delete[] gsm7bit;
   return length;
 }
 

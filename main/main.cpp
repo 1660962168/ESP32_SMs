@@ -62,7 +62,7 @@ typedef struct
     MsgType_t type;
     char sender[32];
     char timestamp[64];
-    char content[256];
+    char content[1024];
 } PushMsg_t;
 
 QueueHandle_t pushQueue;
@@ -360,7 +360,7 @@ void Task_Push_Dispatcher(void *pvParameters)
             // 策略 A: 4G
             for (int i = 0; i < 2; i++)
             {
-                std::string payload = "{\"title\":\"" + base_title + "[4G]\",\"desp\":\"" + desp + "\",\"tags\":\"" + tags + "\"}";
+                std::string payload = "{\"title\":\"" + safe_title + "[4G]\",\"desp\":\"" + safe_desp + "\",\"tags\":\"" + safe_tags + "\"}";
                 if (exec4GPost(payload))
                 {
                     pushSuccess = true;
@@ -373,7 +373,7 @@ void Task_Push_Dispatcher(void *pvParameters)
             {
                 for (int i = 0; i < 2; i++)
                 {
-                    std::string payload = "{\"title\":\"" + base_title + "[WIFI]\",\"desp\":\"" + desp + "\",\"tags\":\"" + tags + "\"}";
+                    std::string payload = "{\"title\":\"" + safe_title + "[WIFI]\",\"desp\":\"" + safe_desp + "\",\"tags\":\"" + safe_tags + "\"}";
                     if (execWiFiPost(payload))
                     {
                         pushSuccess = true;
@@ -456,13 +456,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
     {
         isWifiConnected = false;
-        if (wifi_retry_count < 10) {
-            wifi_retry_count++;
-            ESP_LOGW(TAG, "Wi-Fi 断开，正在尝试重连... (%d/10)", wifi_retry_count);
-            esp_wifi_connect(); 
-        } else {
-            ESP_LOGE(TAG, "Wi-Fi 重连失败次数过多，暂不重连。");
-        }
+        wifi_retry_count++;
+        ESP_LOGW(TAG, "Wi-Fi 断开，正在执行无限重连策略... (累计: %d)", wifi_retry_count);
+        esp_wifi_connect(); 
     }
     else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
     {
@@ -547,12 +543,10 @@ extern "C" void app_main(void)
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         esp_wifi_init(&cfg);
         wifi_config_t w_cfg = {};
-        // 【修改】：使用 strncpy 替代 strcpy，防止 NVS 里的脏数据引发内存越界
-        strncpy((char *)w_cfg.sta.ssid, savedSSID, sizeof(w_cfg.sta.ssid) - 1);
-        w_cfg.sta.ssid[sizeof(w_cfg.sta.ssid) - 1] = '\0';
-        
-        strncpy((char *)w_cfg.sta.password, savedPass, sizeof(w_cfg.sta.password) - 1);
-        w_cfg.sta.password[sizeof(w_cfg.sta.password) - 1] = '\0';
+        memset(w_cfg.sta.ssid, 0, sizeof(w_cfg.sta.ssid));
+        memset(w_cfg.sta.password, 0, sizeof(w_cfg.sta.password));
+        memcpy(w_cfg.sta.ssid, savedSSID, strnlen(savedSSID, sizeof(w_cfg.sta.ssid)));
+        memcpy(w_cfg.sta.password, savedPass, strnlen(savedPass, sizeof(w_cfg.sta.password)));
         esp_wifi_set_mode(WIFI_MODE_STA);
         esp_wifi_set_config(WIFI_IF_STA, &w_cfg);
         esp_wifi_start();

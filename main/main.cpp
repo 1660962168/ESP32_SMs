@@ -77,6 +77,59 @@ std::string formatPDUTime(const char* pduTime) {
     return std::string(pduTime);
 }
 
+// 验证码提取函数
+std::string extractVerificationCode(const std::string& content) {
+    // 策略 1：关键词向后匹配（适用于 "验证码是：123456" 或带有字母的 "Code: A4b9C"）
+    const char* keywords[] = {"验证码", "校验码", "动态码", "确认码", "激活码", "随机码", "提取码", "取件码", "code", "Code", "密码"};
+    for (const char* kw : keywords) {
+        size_t pos = content.find(kw);
+        if (pos != std::string::npos) {
+            size_t start = pos + strlen(kw);
+            std::string code = "";
+            bool found_start = false;
+            // 往后最多扫描 30 个字符
+            for (size_t i = start; i < content.length() && i < start + 30; ++i) {
+                char c = content[i];
+                // 仅提取数字和大小写字母
+                if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+                    code += c;
+                    found_start = true;
+                } else if (found_start) {
+                    break; // 遇到非字母/数字，认为验证码结束
+                }
+            }
+            // 常见的验证码长度在 4 到 8 位之间
+            if (code.length() >= 4 && code.length() <= 8) {
+                return code;
+            }
+        }
+    }
+
+    // 策略 2：纯数字兜底扫描（适用于验证码在开头的情况，例如 "【某某云】123456是您的登录验证码"）
+    std::string digits = "";
+    std::string best_fallback = "";
+    for (size_t i = 0; i < content.length(); ++i) {
+        char c = content[i];
+        if (c >= '0' && c <= '9') {
+            digits += c;
+        } else {
+            // 找到了一个独立的数字串
+            if (digits.length() >= 4 && digits.length() <= 8) {
+                if (digits.length() == 6) return digits; // 6位数字最可能是验证码，直接返回
+                if (best_fallback.empty()) best_fallback = digits; // 暂存 4, 5, 7, 8 位的数字
+            }
+            digits = ""; // 清空，准备记录下一个数字串
+        }
+    }
+    // 检查末尾收尾的数字串
+    if (digits.length() >= 4 && digits.length() <= 8) {
+        if (digits.length() == 6) return digits;
+        if (best_fallback.empty()) best_fallback = digits;
+    }
+    
+    return best_fallback; // 如果没找到验证码，这里会返回空字符串 ""
+}
+
 bool sendCmdAndWait(uart_port_t uart_num, const char* cmd, const char* resp1, const char* resp2, uint32_t timeout_ms) {
     uart_flush(uart_num);
     if (cmd != nullptr) {
@@ -93,6 +146,7 @@ bool sendCmdAndWait(uart_port_t uart_num, const char* cmd, const char* resp1, co
             if (resp1 && resp.find(resp1) != std::string::npos) return true;
             if (resp2 && resp.find(resp2) != std::string::npos) return true;
         }
+        vTaskDelay(1);
     }
     return false;
 }
@@ -112,27 +166,46 @@ bool exec4GPost(const std::string& payload) {
     uart_flush(UART_PORT1);
     std::string cmd = "AT+MIPOPEN=0,\"TCP\",\"14409.push.ft07.com\",80,,1\r\n";
     uart_write_bytes(UART_PORT1, cmd.c_str(), cmd.length());
+    
     uint32_t startWait = esp_timer_get_time() / 1000;
     std::string respBuffer = "";
     uint8_t data[2];
     bool gotConnect = false;
-    while ((esp_timer_get_time() / 1000) - startWait < 10000) {
+    
+    // 【修改点 1】：将 10000 (10秒) 缩短为 5000 (5秒)
+    while ((esp_timer_get_time() / 1000) - startWait < 5000) {
         int len = uart_read_bytes(UART_PORT1, data, 1, pdMS_TO_TICKS(10));
         if (len > 0) {
             respBuffer += (char)data[0];
+            
+            // 【修改点 2，极其重要】：给 4G 串口接收也加上内存保护（泄洪阀）
+            // 如果 4G 模块一直发乱码且找不到 CONNECT，超 512 字节就清空，防止死机
+            if (respBuffer.length() > 512) {
+                respBuffer.clear();
+            }
+
             if (respBuffer.find("CONNECT") != std::string::npos) { gotConnect = true; break; }
             if (respBuffer.find("ERROR") != std::string::npos) return false;
         }
     }
-    if (!gotConnect) return false;
+    
+    if (!gotConnect) {
+        ESP_LOGW(TAG, "4G 模块 TCP 连接超时或失败");
+        return false;
+    }
+    
     std::string http_req = "POST /send/sctp14409tno3vvkydvds2gazyz1er96.send HTTP/1.1\r\nHost: 14409.push.ft07.com\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(payload.length()) + "\r\nConnection: close\r\n\r\n" + payload;
     uart_write_bytes(UART_PORT1, http_req.c_str(), http_req.length());
+    
     startWait = esp_timer_get_time() / 1000;
     bool pushSuccess = false;
+    
+    // 发送 POST 数据后的等待响应时间，你原本就是写的 5000ms，保持不变即可
     while ((esp_timer_get_time() / 1000) - startWait < 5000) {
         int len = uart_read_bytes(UART_PORT1, data, 1, pdMS_TO_TICKS(10));
         if (len > 0 && ((char)data[0] == '2')) { pushSuccess = true; } // 粗略匹配 200 OK
     }
+    
     vTaskDelay(pdMS_TO_TICKS(1000));
     uart_write_bytes(UART_PORT1, "+++", 3);
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -145,11 +218,20 @@ bool execWiFiPost(const std::string& payload) {
     config.url = PUSH_URL;
     config.transport_type = HTTP_TRANSPORT_OVER_SSL;
     config.crt_bundle_attach = esp_crt_bundle_attach; 
+
     esp_http_client_handle_t client = esp_http_client_init(&config);
+    config.timeout_ms = 5000;
+    if (client == NULL) {
+        ESP_LOGE(TAG, "HTTPS 客户端初始化失败");
+        return false;
+    }
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(client, payload.c_str(), payload.length());
     esp_err_t err = esp_http_client_perform(client);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "HTTPS POST 失败: %s", esp_err_to_name(err));
+    }
     bool success = (err == ESP_OK && esp_http_client_get_status_code(client) == 200);
     esp_http_client_cleanup(client);
     return success;
@@ -167,11 +249,17 @@ void Task_Push_Dispatcher(void *pvParameters) {
                 int wait_count = 0;
                 while (!isWifiConnected && wait_count < 20) { vTaskDelay(pdMS_TO_TICKS(500)); wait_count++; }
                 base_title = "设备开机通知";
-                desp = isWifiConnected ? ("硬件启动成功\\n\\n局域网IP：" + std::string(currentIP)) : "硬件启动成功\\n\\n网络：WiFi 未连接";
+                desp = isWifiConnected ? ("设备启动成功\\n\\n局域网IP：" + std::string(currentIP)) : "设备启动成功\\n\\n网络：WiFi 未连接";
                 tags = "开机信息";
             } else {
-                base_title = "收到新短信";
-                desp = "- 发件人: " + std::string(msg.sender) + "\\n\\n- 时间: " + std::string(msg.timestamp) + "\\n\\n- 内容: \\n\\n> " + std::string(msg.content);
+                std::string content_str = std::string(msg.content);
+                std::string vcode = extractVerificationCode(content_str);
+                if (!vcode.empty()) {
+                    base_title = "验证码："+ vcode; 
+                } else {
+                    base_title = "收到新短信";
+                }
+                desp = "- 发件人: " + std::string(msg.sender) + "\\n\\n- 时间: " + std::string(msg.timestamp) + "\\n\\n- 内容: \\n\\n> " + content_str;
                 tags = "短信";
             }
 
@@ -199,6 +287,11 @@ void processSMS(uart_port_t uart_num, int devNum, SMSState& state, std::string& 
     uint8_t data[128];
     int length = uart_read_bytes(uart_num, data, sizeof(data) - 1, pdMS_TO_TICKS(10));
     if (length > 0) { data[length] = '\0'; rx_buffer += (char*)data; }
+    if (rx_buffer.length() > 2048) {
+        ESP_LOGE(TAG, "[设备%d] RX Buffer 溢出！执行清空", devNum);
+        rx_buffer.clear();
+        state = IDLE;
+    }
     size_t pos;
     while ((pos = rx_buffer.find('\n')) != std::string::npos) {
         std::string line = rx_buffer.substr(0, pos);
